@@ -15,7 +15,6 @@ class Data(data.Dataset):
             dataset = data['valid']
         else:
             dataset = data['test']
-
         text = dataset['text'].astype(np.float32)
         text[text == -np.inf] = 0
         self.text = torch.tensor(text)
@@ -26,7 +25,7 @@ class Data(data.Dataset):
         vision[vision == -np.inf] = 0
         self.vision = torch.tensor(vision)
         self.label = dataset['labels'].astype(np.float32)  ##happy, sad, angry, neutral
-
+      
 
     def __len__(self):
         return len(self.text)
