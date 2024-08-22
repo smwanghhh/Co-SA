@@ -7,21 +7,9 @@ from einops import rearrange, repeat
 from torch.nn import functional as F
 
 
-class Cross_Attention(nn.Module):
-    def __init__(self, emb_size, dropout):
-        super(Cross_Attention, self).__init__()
-
-        self.emb_size = emb_size
-
-
-    def forward(self, x, attention_scores):         
-        out = torch.mul(x, attention_scores)
-        return out
-
-
-class Intra_Attention(nn.Module):
+class DPSR(nn.Module):
     def __init__(self, emb_size, head, dropout):
-        super(Intra_Attention, self).__init__()
+        super(DPSR, self).__init__()
 
         self.num_attention_heads = head
         self.attention_head_size = emb_size // head
@@ -64,21 +52,6 @@ class Intra_Attention(nn.Module):
         out = context_layer + self.dense1(context_layer)
   
         return self.norm(out)
-
-
-class PositionalEncoding(torch.nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super().__init__()
-        self.encoding = torch.zeros(max_len, d_model)
-        positions = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        self.encoding[:, 0::2] = torch.sin(positions * div_term)
-        self.encoding[:, 1::2] = torch.cos(positions * div_term)
-        self.encoding = self.encoding.unsqueeze(0)
-        self.encoding = self.encoding.cuda()
-        
-    def forward(self, x):
-        return x + self.encoding[:, :x.size(1)]
     
 
 class Model(nn.Module):
@@ -89,34 +62,24 @@ class Model(nn.Module):
         self.emb_size = config.emb_size
         self.length = config.seqlength
         self.dim_t, self.dim_v, self.dim_a = config.dim_t, config.dim_v, config.dim_a
-        self.criterion1 = nn.CrossEntropyLoss()
-        self.criterion2 = nn.L1Loss()
         self.n_head = config.n_head
 
         ####text encoder and decoder
-        self.encoder_te = nn.Linear(self.dim_t, self.emb_size)
-        self.encoder_tm = nn.Linear(self.dim_t, self.emb_size)
-        self.decoder_t = nn.Sequential(nn.Linear(self.emb_size * 2, self.emb_size), nn.Linear(self.emb_size, self.dim_t))
+        self.encoder_t = nn.Linear(self.dim_t, self.emb_size)
 
         ####visual encoder and decoder
-        self.encoder_ve = nn.Linear(self.dim_v, self.emb_size)
-        self.encoder_vm = nn.Linear(self.dim_v, self.emb_size)
-        self.decoder_v = nn.Sequential(nn.Linear(self.emb_size * 2, self.emb_size), nn.Linear(self.emb_size, self.dim_v))
+        self.encoder_v = nn.Linear(self.dim_v, self.emb_size)
 
          ####acoustic encoder and decoder
-        self.encoder_ae = nn.Linear(self.dim_a, self.emb_size)
-        self.encoder_am = nn.Linear(self.dim_a, self.emb_size)
-        self.decoder_a = nn.Sequential(nn.Linear(self.emb_size * 2, self.emb_size), nn.Linear(self.emb_size, self.dim_a))
+        self.encoder_a = nn.Linear(self.dim_a, self.emb_size)
 
-        ###modality classifier  0: text, 1: visual,  2: acoustic
-        self.classifier_m = nn.Linear(self.emb_size, 3)
-        self.intra_t = Intra_Attention(self.emb_size, self.n_head, self.att_dp)
-        self.intra_a = Intra_Attention(self.emb_size, self.n_head, self.att_dp)
-        self.intra_v = Intra_Attention(self.emb_size, self.n_head, self.att_dp)
+        self.dpsr_t = DPSR(self.emb_size, self.n_head, self.att_dp)
+        self.dpsr_a = DPSR(self.emb_size, self.n_head, self.att_dp)
+        self.dpsr_v = DPSR(self.emb_size, self.n_head, self.att_dp)
 
-        self.intra_t.cuda()
-        self.intra_a.cuda()
-        self.intra_v.cuda()
+        self.dpsr_t.cuda()
+        self.dpsr_a.cuda()
+        self.dpsr_v.cuda()
 
     def weight(self, length):
         w = torch.ones(size=(length, length))
@@ -133,30 +96,16 @@ class Model(nn.Module):
     def forward(self, text, visual, acoustic):
 
         self.batch = visual.shape[0]
- 
-        ###disentangle
-        x_te, x_ve, x_ae = self.encoder_te(text), self.encoder_ve(visual), self.encoder_ae(acoustic) ##[l,b, emb_size]
-        x_tm, x_vm, x_am = self.encoder_tm(text), self.encoder_vm(visual), self.encoder_am(acoustic) ##[l,b, emb_size]
-        ####modality classifier
-        prediction1 = rearrange(self.classifier_m(x_tm), 'h b d -> (h b) d')
-        prediction2 = rearrange(self.classifier_m(x_vm), 'h b d -> (h b) d')
-        prediction3 = rearrange(self.classifier_m(x_am), 'h b d -> (h b) d')
-        #####decoder
-        x_t_, x_v_, x_a_ = self.decoder_t(torch.cat([x_te, x_tm], -1)), self.decoder_v(torch.cat([x_ve, x_vm], -1)), self.decoder_a(torch.cat([x_ae, x_am], -1))
-        ###loss
-        t_truth = torch.zeros(self.length * self.batch).long().cuda()
-        v_truth = torch.ones(self.length * self.batch).long().cuda()
-        a_truth = 2 * torch.ones(self.length * self.batch).long().cuda()
-        loss_m = (self.criterion1(prediction1, t_truth) + self.criterion1(prediction2, v_truth) + self.criterion1(prediction3, a_truth)) /3
-        loss_d = (self.criterion2(x_t_, text) + self.criterion2(x_v_, visual) + self.criterion2(x_a_, acoustic)) / 3- \
-                    (self.criterion2(x_te, x_tm) + self.criterion2(x_ve, x_vm) + self.criterion2(x_ae, x_am)) / 3
-                    
-        ###psr
-        x_te = self.intra_t(x_te)
-        x_ae = self.intra_a(x_ae)
-        x_ve = self.intra_v(x_ve)
 
-        x_t_norm, x_a_norm, x_v_norm = F.normalize(x_te, dim=2), F.normalize(x_ae, dim=2), F.normalize(x_ve, dim=2)
+        ###disentangle
+        x_t, x_v, x_a = self.encoder_t(text), self.encoder_v(visual), self.encoder_a(acoustic) ##[l,b, emb_size]
+                    
+        ###dpsr
+        x_t = self.dpsr_t(x_t)
+        x_a = self.dpsr_a(x_a)
+        x_v = self.dpsr_v(x_v)
+        ###dpsr loss
+        x_t_norm, x_a_norm, x_v_norm = F.normalize(x_t, dim=2), F.normalize(x_a, dim=2), F.normalize(x_v, dim=2)
         corr_t, corr_a, corr_v = torch.matmul(x_t_norm, x_t_norm.permute(0, 2, 1)), torch.matmul(x_a_norm, x_a_norm.permute(0, 2,
                                                                                                                   1)), torch.matmul(x_v_norm, x_v_norm.permute(0, 2, 1))
         
@@ -171,7 +120,7 @@ class Model(nn.Module):
                     self.length * (self.length - 1) / 2), corrv / (self.length * (self.length - 1) / 2)
         corr_loss = (corrt_mean + corra_mean + corrv_mean) / 3
 
-        return torch.cat((x_te, x_ae, x_ve), 1), loss_m, loss_d, corr_loss
+        return torch.cat((x_t, x_a, x_v), 1), corr_loss
 
 
 class Actor(nn.Module):
@@ -190,30 +139,26 @@ class Actor(nn.Module):
         self.proj_v = nn.Linear(self.emb_size, self.emb_size)
 
 
-        self.attention_t = nn.Sequential(nn.Linear(self.emb_size * 3, 1), nn.Sigmoid())
-        self.attention_a = nn.Sequential(nn.Linear(self.emb_size * 3, 1), nn.Sigmoid())
-        self.attention_v = nn.Sequential(nn.Linear(self.emb_size * 3, 1), nn.Sigmoid())
-
-        self.cross = Cross_Attention(self.emb_size, self.att_dp)
-
-        self.cross.cuda()
+        self.action_t = nn.Sequential(nn.Linear(self.emb_size * 2, 1), nn.Sigmoid())
+        self.action_a = nn.Sequential(nn.Linear(self.emb_size * 2, 1), nn.Sigmoid())
+        self.action_v = nn.Sequential(nn.Linear(self.emb_size * 2, 1), nn.Sigmoid())
 
         layer = nn.TransformerEncoderLayer(d_model=self.emb_size, nhead=self.n_head, dropout=self.att_dp)
-        self.intra_modality_t = nn.TransformerEncoder(layer, num_layers=num_layer)
-        self.intra_modality_a = nn.TransformerEncoder(layer, num_layers=num_layer)
-        self.intra_modality_v = nn.TransformerEncoder(layer, num_layers=num_layer)
+        self.temporal_t = nn.TransformerEncoder(layer, num_layers=num_layer)
+        self.temporal_a = nn.TransformerEncoder(layer, num_layers=num_layer)
+        self.temporal_v = nn.TransformerEncoder(layer, num_layers=num_layer)
 
         
 
-        # self.classifier_e = nn.Sequential(nn.Linear(self.emb_size * 3, self.emb_size * 2),
+        # self.classifier_e = nn.Sequential(nn.Linear(self.emb_size * 3, self.emb_size*3),
         #                                     nn.Dropout(self.dropout),
         #                                     nn.ReLU(),
-        #                                     nn.BatchNorm1d(self.emb_size * 2),
-        #                                     nn.Linear(self.emb_size * 2, self.emb_size),
-        #                                     nn.Dropout(self.dropout),
-        #                                     nn.ReLU(),
-        #                                     nn.BatchNorm1d(self.emb_size),
-        #                                     nn.Linear(self.emb_size, 8))
+        #                                     nn.BatchNorm1d(self.emb_size*3),
+        #                                     # nn.Linear(self.emb_size, self.emb_size),
+        #                                     # nn.Dropout(self.dropout),
+        #                                     # nn.ReLU(),
+        #                                     # nn.BatchNorm1d(self.emb_size),
+        #                                     nn.Linear(self.emb_size*3, 8))
 
 
         self.classifier_e = nn.Sequential( 
@@ -223,15 +168,81 @@ class Actor(nn.Module):
                                            nn.BatchNorm1d(self.emb_size),
                                            nn.Linear(self.emb_size, 8))
 
-    
+    def generate_advise(self, text, audio, vision): 
+        sim_ta, sim_tv, sim_at, sim_av, sim_vt, sim_va = self.similarity_matrix(text, audio, vision)
+        diff_ta, diff_tv, diff_at, diff_av, diff_vt, diff_va = -sim_ta, -sim_tv, -sim_at, -sim_av, -sim_vt, -sim_va
+        ###text-center
+        sim_tt = torch.ones_like(sim_ta)
+        tt, ta, tv, ta_neg, tv_neg = torch.sum(sim_tt, dim= [1, 2]), torch.sum(sim_ta, dim= [1, 2]), torch.sum(sim_tv, dim= [1, 2]), torch.sum(diff_ta, dim= [1, 2]), torch.sum(diff_tv, dim= [1, 2])
+        scale_t = torch.nn.Softmax(1)(torch.cat((tt.unsqueeze(1), ta.unsqueeze(1), tv.unsqueeze(1), ta_neg.unsqueeze(1), tv_neg.unsqueeze(1)), 1))
+        advise_ta = torch.matmul(nn.Softmax(-1)(sim_ta), audio)
+        advise_tv = torch.matmul(nn.Softmax(-1)(sim_tv), vision)        
+        advise_ta_neg = torch.matmul(nn.Softmax(-1)(diff_ta), audio)
+        advise_tv_neg = torch.matmul(nn.Softmax(-1)(diff_tv), vision)
+        advise_t = text * repeat(scale_t[:, 0], 'b -> b t c', t=self.length, c= self.emb_size) + \
+                    advise_ta * repeat(scale_t[:, 1],'b -> b t c', t=self.length, c= self.emb_size) + \
+                    advise_tv * repeat(scale_t[:, 2], 'b -> b t c', t=self.length, c= self.emb_size) + \
+                    advise_ta_neg * repeat(scale_t[:, 3], 'b -> b t c', t=self.length, c= self.emb_size) +\
+                    advise_tv_neg * repeat(scale_t[:, 4], 'b -> b t c', t=self.length, c= self.emb_size)   
+        ###audio-center
+        sim_aa = torch.ones_like(sim_ta)
+        aa, at, av, at_neg, av_neg = torch.sum(sim_aa, dim= [1, 2]), torch.sum(sim_at, dim= [1, 2]), torch.sum(sim_av, dim= [1, 2]), torch.sum(diff_at, dim= [1, 2]), torch.sum(diff_av, dim= [1, 2]) 
+        scale_a = torch.nn.Softmax(1)(torch.cat((aa.unsqueeze(1), at.unsqueeze(1), av.unsqueeze(1), at_neg.unsqueeze(1), av_neg.unsqueeze(1)), 1))
+        advise_at = torch.matmul(nn.Softmax(-1)(sim_at), text)
+        advise_av = torch.matmul(nn.Softmax(-1)(sim_av), vision)        
+        advise_at_neg = torch.matmul(nn.Softmax(-1)(diff_at), text)
+        advise_av_neg = torch.matmul(nn.Softmax(-1)(diff_av), vision)
+        advise_a = audio * repeat(scale_a[:, 0], 'b -> b t c', t=self.length, c= self.emb_size) +\
+              advise_at * repeat(scale_a[:, 1], 'b -> b t c', t=self.length, c= self.emb_size) + \
+              advise_av * repeat(scale_a[:, 2], 'b -> b t c', t=self.length, c= self.emb_size) + \
+              advise_at_neg * repeat(scale_a[:, 3], 'b -> b t c', t=self.length, c= self.emb_size) +\
+              advise_av_neg * repeat(scale_a[:, 4], 'b -> b t c', t=self.length, c= self.emb_size) 
+        ###vision-center
+        sim_vv = torch.ones_like(sim_ta)
+        vv, vt, va, vt_neg, va_neg = torch.sum(sim_vv, dim= [1, 2]), torch.sum(sim_vt, dim= [1, 2]), torch.sum(sim_va, dim= [1, 2]), torch.sum(diff_vt, dim= [1, 2]), torch.sum(diff_va, dim= [1, 2]) 
+        scale_v = torch.nn.Softmax(1)(torch.cat((vv.unsqueeze(1), vt.unsqueeze(1), va.unsqueeze(1), vt_neg.unsqueeze(1), va_neg.unsqueeze(1)), 1))
+        advise_vt = torch.matmul(nn.Softmax(-1)(sim_vt), text)
+        advise_va = torch.matmul(nn.Softmax(-1)(sim_va), audio)        
+        advise_vt_neg = torch.matmul(nn.Softmax(-1)(diff_vt), text)
+        advise_va_neg = torch.matmul(nn.Softmax(-1)(diff_va), audio)
+        advise_v = vision * repeat(scale_v[:, 0], 'b -> b t c', t=self.length, c= self.emb_size) + \
+            advise_vt * repeat(scale_v[:, 1], 'b -> b t c', t=self.length, c= self.emb_size) + \
+            advise_va * repeat(scale_v[:, 2], 'b -> b t c', t=self.length, c= self.emb_size) + \
+            advise_vt_neg * repeat(scale_v[:, 3], 'b -> b t c', t=self.length, c= self.emb_size) + \
+            advise_va_neg * repeat(scale_v[:, 4], 'b -> b t c', t=self.length, c= self.emb_size)
+        return advise_t, advise_a, advise_v     
+
+
+    def similarity_matrix(self, emb_t, emb_a, emb_v):
+        emb_t_norm = F.normalize(emb_t, p=2, dim = 2)
+        emb_a_norm = F.normalize(emb_a, p=2, dim = 2)
+        emb_v_norm = F.normalize(emb_v, p=2, dim = 2)
+
+        ###text TA, TV
+        similarity_ta = torch.matmul(emb_t_norm, emb_a_norm.permute(0, 2, 1))
+        similarity_tv = torch.matmul(emb_t_norm, emb_v_norm.permute(0, 2, 1))
+
+        ###audio, AT, AV
+        similarity_at = torch.matmul(emb_a_norm,emb_t_norm.permute(0, 2, 1))
+        similarity_av = torch.matmul(emb_a_norm, emb_v_norm.permute(0, 2, 1))
+
+        ###vision VT, VA
+        similarity_vt = torch.matmul(emb_v_norm, emb_t_norm.permute(0, 2, 1))
+        similarity_va = torch.matmul(emb_v_norm, emb_a_norm.permute(0, 2, 1))
+
+        return similarity_ta, similarity_tv, similarity_at, similarity_av, similarity_vt, similarity_va
+
 
     def forward(self, inputs):
         x_t, x_a, x_v = inputs[:, :self.length], inputs[:, self.length:self.length * 2], inputs[:, self.length * 2:]
         self.batch = inputs.shape[0]
+
+        x_t_, x_a_, x_v_ = self.proj_t(x_t), self.proj_a(x_a), self.proj_v(x_v)
+        advise_t, advise_a, advise_v = self.generate_advise(x_t_, x_a_, x_v_)
         
-        action_t = self.attention_t(torch.cat((x_t, self.proj_t(x_t - x_a), self.proj_t(x_t - x_v)), -1))
-        action_a = self.attention_a(torch.cat((x_a, self.proj_a(x_a - x_t), self.proj_a(x_a - x_v)), -1))
-        action_v = self.attention_v(torch.cat((x_v, self.proj_v(x_v - x_t), self.proj_v(x_v - x_a)), -1))
+        action_t = self.action_t(torch.cat((x_t, advise_t), -1))
+        action_a = self.action_a(torch.cat((x_a, advise_a), -1))
+        action_v = self.action_v(torch.cat((x_v, advise_v), -1))
 
         action = torch.cat((action_t, action_a, action_v), 1)
         return action
@@ -245,9 +256,10 @@ class Actor(nn.Module):
         action_t = action_t.reshape(self.batch, self.length, 1).repeat(1, 1, self.emb_size) 
         action_a = action_a.reshape(self.batch, self.length, 1).repeat(1, 1, self.emb_size) 
         action_v = action_v.reshape(self.batch, self.length, 1).repeat(1, 1, self.emb_size) 
-        x_t_o = self.cross(state_t, action_t)     
-        x_a_o = self.cross(state_a, action_a)
-        x_v_o = self.cross(state_v, action_v)
+
+        x_t_o = torch.mul(state_t, action_t)
+        x_a_o = torch.mul(state_a, action_a)
+        x_v_o = torch.mul(state_v, action_v)
 
         state_new = torch.cat((x_t_o, x_a_o, x_v_o), 1)
         return state_new
@@ -256,9 +268,9 @@ class Actor(nn.Module):
         x_t, x_a, x_v = inputs[:, :self.length], inputs[:, self.length:self.length * 2], inputs[:, self.length * 2:]
         emb_t, emb_a, emb_v = x_t.permute(1, 0, 2), x_a.permute(1, 0, 2), x_v.permute(1, 0, 2)
 
-        emb_t = self.intra_modality_t(emb_t)
-        emb_a = self.intra_modality_a(emb_a)
-        emb_v = self.intra_modality_v(emb_v)
+        emb_t = self.temporal_t(emb_t)
+        emb_a = self.temporal_a(emb_a)
+        emb_v = self.temporal_v(emb_v)
 
         emb_t, emb_a, emb_v = emb_t.permute(1, 0, 2), emb_a.permute(1, 0, 2), emb_v.permute(1, 0, 2)
 
@@ -280,9 +292,9 @@ class Critic(nn.Module):
 
 
         layer = nn.TransformerEncoderLayer(d_model=self.emb_size + self.n_head, nhead=self.n_head, dropout=self.att_dp)
-        self.intra_modality_state_t = nn.TransformerEncoder(layer, num_layers=num_layer)
-        self.intra_modality_state_a = nn.TransformerEncoder(layer, num_layers=num_layer)
-        self.intra_modality_state_v = nn.TransformerEncoder(layer, num_layers=num_layer)
+        self.critic_t = nn.TransformerEncoder(layer, num_layers=num_layer)
+        self.critic_a = nn.TransformerEncoder(layer, num_layers=num_layer)
+        self.critic_v = nn.TransformerEncoder(layer, num_layers=num_layer)
         
 
         self.proj = nn.Sequential(
@@ -307,9 +319,9 @@ class Critic(nn.Module):
         text, visual, acoustic = text.permute(1, 0, 2), visual.permute(1, 0, 2), acoustic.permute(1,0,2)
         
 
-        text = self.intra_modality_state_t(text)
-        visual = self.intra_modality_state_v(visual)
-        acoustic = self.intra_modality_state_a(acoustic)
+        text = self.critic_t(text)
+        visual = self.critic_v(visual)
+        acoustic = self.critic_a(acoustic)
 
         text, acoustic, visual = text.permute(1, 0, 2).mean(1), acoustic.permute(1, 0, 2).mean(1), visual.permute(1, 0, 2).mean(1)
 

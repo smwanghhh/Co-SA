@@ -18,22 +18,21 @@ from tqdm import tqdm
 parser = argparse.ArgumentParser(description='Co-SA')
 parser.add_argument('--emb_size', default=128, type=int)
 parser.add_argument('--seqlength', default=20, type=int)
-parser.add_argument("--n_epochs", type=int, default=500)
+parser.add_argument("--n_epochs", type=int, default=200)
 parser.add_argument("--n_head", type=int, default=8)
-parser.add_argument("--dropout", type=float, default=0.0)
-parser.add_argument("--atten_dropout", type=float, default=0.) 
-parser.add_argument('--lr', default=0.0001, type=float) 
-parser.add_argument("--train_batch_size", type=int, default=128) 
+parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--atten_dropout", type=float, default=0.0) 
+parser.add_argument('--lr', default=0.00022, type=float) ###0.00018 for add; 0.00022 for cat
+parser.add_argument("--train_batch_size", type=int, default=128)
 parser.add_argument("--dev_batch_size", type=int, default=256)
 parser.add_argument("--test_batch_size", type=int, default=256)
 parser.add_argument('--dim_t', default=300, type=int)
 parser.add_argument('--dim_a', default=74, type=int)
 parser.add_argument('--dim_v', default=35, type=int)
-parser.add_argument('--seed', default=9324, type=seed)  ###9324
-parser.add_argument('--w1', default=9, type=int)
-parser.add_argument('--w2', default=1, type=float)
-parser.add_argument('--w3', default=30, type=int)  
-parser.add_argument('--w4', default=1, type=float)
+parser.add_argument('--seed', default=9324, type=seed)
+parser.add_argument('--w1', default=9, type=int) #9
+parser.add_argument('--w2', default=10, type=int) #10 
+parser.add_argument('--w3', default=9, type=float)##9
 parser.add_argument('--path', default='./iemocap_data.pkl', type=str)
 
 args = parser.parse_args()
@@ -68,7 +67,6 @@ def main(args):
 	train_dataset = loader.Data(args.path, 'train')
 	dev_dataset = loader.Data(args.path, 'valid')
 	test_dataset = loader.Data(args.path, 'test')
-
 	train_dataloader = DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True, drop_last = True)
 
@@ -93,10 +91,12 @@ def main(args):
 	actor_optimizer = optim.Adam(actor.parameters(), lr=args.lr)
 	critic_optimizer = optim.Adam(critic.parameters(), lr=args.lr)
 
-	model_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(model_optimizer, mode='min', patience=50, factor=0.95, verbose=False)  # 50, 0.95
-	actor_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(actor_optimizer, mode='min', patience=50, factor=0.95, verbose=False)
-	critic_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(critic_optimizer, mode='min', patience=50, factor=0.95, verbose=False)
-
+	model_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(model_optimizer, mode='min', patience=20, factor=0.8, verbose=False)  # 30, 0.8 for add
+	actor_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(actor_optimizer, mode='min', patience=20, factor=0.8, verbose=False) # 20, 0.8 for cat
+	critic_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(critic_optimizer, mode='min', patience=20, factor=0.8, verbose=False)
+#	total_params = sum(p.numel() for p in actor.parameters())
+#	print(total_params)
+#	return 0
 	model = model.cuda()
 	actor = actor.cuda()
 	actor_target = actor_target.cuda()
@@ -170,7 +170,7 @@ def train_epoch(model, actor, critic, actor_target, critic_target, train_dataloa
     data_iter = iter(train_dataloader)
     if last[0] is not None:
         iter_num = len(data_iter)
-        input, label, state, loss_d, loss_m, corr_loss = last
+        input, label, state, corr_loss = last
     else: ###the first batch
         iter_num = len(data_iter) - 1
         batch = next(data_iter)
@@ -179,7 +179,7 @@ def train_epoch(model, actor, critic, actor_target, critic_target, train_dataloa
         label_ids = label_ids.squeeze()
         visual = torch.squeeze(visual, 1)
         acoustic = torch.squeeze(acoustic, 1)
-        embs, loss_m, loss_d, corr_loss = model.forward(text, visual, acoustic)
+        embs, corr_loss = model.forward(text, visual, acoustic)
         input, label, state = embs, label_ids, embs 
     b = state.shape[0]
 
@@ -195,7 +195,7 @@ def train_epoch(model, actor, critic, actor_target, critic_target, train_dataloa
         label = label.view(-1)
         loss_e = criterion(pred, label).mean()
 
-        loss = loss_e * args.w1 + loss_d * args.w2 + loss_m * args.w2 + corr_loss.mean() * args.w3 
+        loss = loss_e * args.w1 + corr_loss.mean() * args.w2 
         loss.backward()
         model_optimizer.step()
         actor_optimizer.step()
@@ -211,7 +211,7 @@ def train_epoch(model, actor, critic, actor_target, critic_target, train_dataloa
         label_ids = label_ids.squeeze()
         visual = torch.squeeze(visual, 1)
         acoustic = torch.squeeze(acoustic, 1) 
-        embs, loss_m, loss_d, corr_loss = model.forward(text, visual, acoustic)
+        embs, corr_loss = model.forward(text, visual, acoustic)
         rep = actor.fused(embs, a)
 
         s2 = rep
@@ -225,7 +225,7 @@ def train_epoch(model, actor, critic, actor_target, critic_target, train_dataloa
            predicted_q = critic(s1_batch, a1_batch)
            a2_batch = actor_target.forward(s2_batch)
            target_q = critic_target(s2_batch, a2_batch) * 0.5 + r_batch
-           critic_loss = torch.mean(nn.L1Loss()(predicted_q, target_q)) * args.w4
+           critic_loss = torch.mean(nn.L1Loss()(predicted_q, target_q)) * args.w3
            critic_loss_sum += critic_loss
            critic_loss.backward() 
            critic_optimizer.step()
@@ -233,7 +233,7 @@ def train_epoch(model, actor, critic, actor_target, critic_target, train_dataloa
         ###actor
            actor_optimizer.zero_grad()
            a1 = actor.forward(s1_batch)  ###!!!!!!!very important  otherwise actor gradient will not be updated
-           actor_loss = -1 * torch.mean(critic(s1_batch, a1)) * args.w4
+           actor_loss = -1 * torch.mean(critic(s1_batch, a1)) * args.w3
            actor_loss_sum += actor_loss
            actor_loss.backward() 
            actor_optimizer.step()
@@ -250,7 +250,7 @@ def train_epoch(model, actor, critic, actor_target, critic_target, train_dataloa
 
         input, label, state = embs, label_ids, s2.data
 
-    last = [input, label, state, loss_d, loss_m, corr_loss]
+    last = [input, label, state, corr_loss]
     return cls_loss_sum / (step + 1), actor_loss_sum / (step+1), critic_loss_sum / (step + 1), last
 
 
@@ -266,7 +266,7 @@ def eval_epoch(model, actor, dev_dataloader):
             text, acoustic, visual, label_ids = batch
             visual = torch.squeeze(visual, 1)
             acoustic = torch.squeeze(acoustic, 1)
-            embs, _, _, _ = model( text, visual,acoustic)
+            embs,  _ = model( text, visual,acoustic)
             a = actor.forward(embs)
             rep = actor.fused(embs, a)
             logits = actor.temporal(rep)
@@ -293,7 +293,7 @@ def test_epoch(model, actor, test_dataloader):
             visual = torch.squeeze(visual, 1)
             acoustic = torch.squeeze(acoustic, 1)
             label_ids = label_ids.squeeze()
-            embs, _, _, _ = model.forward(text, visual, acoustic)
+            embs, _ = model.forward(text, visual, acoustic)
             a = actor.forward(embs)
             rep = actor.fused(embs, a)
             logits = actor.temporal(rep)
